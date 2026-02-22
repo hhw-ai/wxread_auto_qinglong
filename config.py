@@ -105,9 +105,9 @@ def parse_curl_command(curl_command):
     headers_temp = {}
     cookies_temp = {}
     
-    # 提取headers
-    header_matches = re.findall(r"-H\s+'([^:]+):\s*([^']+)'", curl_command)
-    for key, value in header_matches:
+    # 提取headers（兼容单引号/双引号）
+    header_matches = re.findall(r"-H\s+(['\"])([^:]+):\s*(.*?)\1", curl_command)
+    for _, key, value in header_matches:
         headers_temp[key.strip()] = value.strip()
     
     # 提取cookies（两种方式）
@@ -118,9 +118,9 @@ def parse_curl_command(curl_command):
                          if k.lower() == 'cookie'), '')
     
     # 方式2：从 -b 参数提取
-    cookie_b_match = re.search(r"-b\s+'([^']+)'", curl_command)
+    cookie_b_match = re.search(r"-b\s+(['\"])(.*?)\1", curl_command)
     if cookie_b_match:
-        cookie_string = cookie_b_match.group(1)
+        cookie_string = cookie_b_match.group(2)
     elif cookie_header:
         cookie_string = cookie_header
     
@@ -135,19 +135,20 @@ def parse_curl_command(curl_command):
     final_headers = {k: v for k, v in headers_temp.items() 
                     if k.lower() != 'cookie'}
     
-    # 更新默认headers
-    final_headers.update(headers)
+    # 合并默认headers（优先使用抓包得到的headers）
+    merged_headers = headers.copy()
+    merged_headers.update(final_headers)
     
     # 更新默认cookies
     final_cookies = cookies.copy()
     final_cookies.update(cookies_temp)
     
-    return final_headers, final_cookies
+    return merged_headers, final_cookies
 
 # 解析curl命令获取headers和cookies
 if WXREAD_CURL_BASH:
     headers, cookies = parse_curl_command(WXREAD_CURL_BASH)
-    print(f"✅ 已从环境变量解析Cookie，共{cookies}个cookie")
+    print(f"✅ 已从环境变量解析Cookie，共{len(cookies)}个cookie")
 else:
     print("⚠️  未设置WXREAD_CURL_BASH环境变量，使用默认headers/cookies")
 
