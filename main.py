@@ -12,6 +12,7 @@ import urllib.parse
 import logging
 import sys
 import requests
+from http.cookies import SimpleCookie
 
 # 添加青龙面板路径
 sys.path.append('/ql/scripts')
@@ -76,18 +77,49 @@ def refresh_cookie():
             data=json.dumps(COOKIE_DATA, separators=(',', ':')),
             timeout=10
         )
-        
-        # 从响应头中提取新的wr_skey
-        set_cookie = response.headers.get('Set-Cookie', '')
-        for cookie_item in set_cookie.split(';'):
-            if 'wr_skey' in cookie_item:
-                new_skey = cookie_item.split('=')[1].split(';')[0][:8]
-                cookies['wr_skey'] = new_skey
-                logger.info(f"✅ Cookie刷新成功，新密钥：{new_skey}")
-                return True
-        
-        logger.error("❌ 未找到新的wr_skey")
-        return False
+
+        if response.status_code != 200:
+            logger.error(f"❌ Cookie刷新失败: HTTP {response.status_code}")
+            return False
+
+        # 使用响应的cookiejar，避免Set-Cookie里expires逗号导致的解析错误
+        new_cookies = requests.utils.dict_from_cookiejar(response.cookies)
+        if not new_cookies:
+            # 兼容部分场景requests未解析Set-Cookie
+            set_cookie_values = []
+            raw_headers = getattr(response.raw, "headers", None)
+            if raw_headers and hasattr(raw_headers, "get_all"):
+                set_cookie_values = raw_headers.get_all("Set-Cookie") or []
+            if not set_cookie_values:
+                set_cookie_header = response.headers.get("Set-Cookie", "")
+                if set_cookie_header:
+                    set_cookie_values = [set_cookie_header]
+
+            if set_cookie_values:
+                parsed = SimpleCookie()
+                for val in set_cookie_values:
+                    try:
+                        parsed.load(val)
+                    except Exception:
+                        continue
+                new_cookies = {k: v.value for k, v in parsed.items()}
+
+        if not new_cookies:
+            logger.error("❌ 未获取到刷新后的Cookie")
+            logger.error(f"调试信息: status={response.status_code}, set-cookie={response.headers.get('Set-Cookie')}")
+            logger.error(f"调试信息: body={response.text[:200]}")
+            return False
+
+        new_skey = new_cookies.get('wr_skey')
+        if not new_skey:
+            logger.error("❌ 未找到新的wr_skey")
+            logger.error(f"调试信息: cookies={list(new_cookies.keys())}, wr_skey={repr(new_skey)}")
+            logger.error(f"调试信息: body={response.text[:200]}")
+            return False
+
+        cookies.update(new_cookies)
+        logger.info(f"✅ Cookie刷新成功，新密钥：{new_skey}")
+        return True
         
     except Exception as e:
         logger.error(f"❌ Cookie刷新失败: {e}")
@@ -145,11 +177,9 @@ def simulate_reading():
         send_notification("微信读书刷时长失败", error_msg)
         return False
     
-    # 初始Cookie刷新
+    # 初始Cookie刷新（失败时继续尝试使用现有Cookie）
     if not refresh_cookie():
-        error_msg = "初始Cookie刷新失败，请检查网络或Cookie有效性"
-        send_notification("微信读书刷时长失败", error_msg)
-        return False
+        logger.warning("⚠️  初始Cookie刷新失败，将尝试使用现有Cookie继续")
     
     index = 1
     last_time = int(time.time()) - 30
