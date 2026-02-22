@@ -70,16 +70,31 @@ def refresh_cookie():
     """刷新微信读书Cookie"""
     logger.info("正在刷新Cookie...")
     try:
+        old_skey = cookies.get('wr_skey', '')
         response = requests.post(
             RENEW_URL,
             headers=headers,
             cookies=cookies,
-            data=json.dumps(COOKIE_DATA, separators=(',', ':')),
+            json=COOKIE_DATA,
             timeout=10
         )
 
         if response.status_code != 200:
             logger.error(f"❌ Cookie刷新失败: HTTP {response.status_code}")
+            return False
+
+        try:
+            body_data = response.json()
+        except ValueError:
+            body_data = {}
+
+        if isinstance(body_data, dict) and body_data.get("errCode") not in (None, 0):
+            logger.error(
+                f"❌ Cookie刷新失败: errCode={body_data.get('errCode')}, "
+                f"errMsg={body_data.get('errMsg')}"
+            )
+            if body_data.get("errCode") == -2013:
+                logger.error("❌ 鉴权失败，请重新抓包更新WXREAD_CURL_BASH环境变量")
             return False
 
         # 使用响应的cookiejar，避免Set-Cookie里expires逗号导致的解析错误
@@ -104,13 +119,16 @@ def refresh_cookie():
                         continue
                 new_cookies = {k: v.value for k, v in parsed.items()}
 
+        # 过滤服务端返回的空值，避免把本地有效cookie覆盖成空字符串
+        new_cookies = {k: v for k, v in new_cookies.items() if v}
+
         if not new_cookies:
             logger.error("❌ 未获取到刷新后的Cookie")
             logger.error(f"调试信息: status={response.status_code}, set-cookie={response.headers.get('Set-Cookie')}")
             logger.error(f"调试信息: body={response.text[:200]}")
             return False
 
-        new_skey = new_cookies.get('wr_skey')
+        new_skey = new_cookies.get('wr_skey') or old_skey
         if not new_skey:
             logger.error("❌ 未找到新的wr_skey")
             logger.error(f"调试信息: cookies={list(new_cookies.keys())}, wr_skey={repr(new_skey)}")
@@ -118,7 +136,8 @@ def refresh_cookie():
             return False
 
         cookies.update(new_cookies)
-        logger.info(f"✅ Cookie刷新成功，新密钥：{new_skey}")
+        cookies['wr_skey'] = new_skey
+        logger.info(f"✅ Cookie刷新成功，当前密钥：{new_skey}")
         return True
         
     except Exception as e:
@@ -220,7 +239,17 @@ def simulate_reading():
                 timeout=15
             )
             
-            response_data = response.json()
+            try:
+                response_data = response.json()
+            except ValueError:
+                logger.error(f"❌ 响应不是JSON: HTTP {response.status_code}, body={response.text[:200]}")
+                failed_count += 1
+                if failed_count >= 3:
+                    error_msg = "连续3次收到非JSON响应，停止运行"
+                    send_notification("微信读书刷时长异常", error_msg)
+                    return False
+                time.sleep(5)
+                continue
             logger.debug(f"响应数据: {json.dumps(response_data, ensure_ascii=False)}")
             
             if 'succ' in response_data:
@@ -249,19 +278,33 @@ def simulate_reading():
                             send_notification("微信读书刷时长异常", error_msg)
                             return False
             else:
-                # Cookie可能过期，尝试刷新
-                logger.warning("❌ 阅读失败，可能Cookie已过期，尝试刷新...")
-                if refresh_cookie():
-                    # Cookie刷新成功，重试本次阅读
-                    logger.info("🔄 Cookie刷新成功，重试本次阅读")
-                    continue
+                err_code = response_data.get('errCode')
+                err_msg = str(response_data.get('errMsg', ''))
+                logger.warning(f"❌ 阅读失败: errCode={err_code}, errMsg={err_msg}")
+
+                is_auth_error = err_code in (-2013, -2014) or ('鉴权' in err_msg)
+                if is_auth_error:
+                    logger.warning("检测到鉴权相关错误，尝试刷新Cookie...")
+                    if refresh_cookie():
+                        # Cookie刷新成功，重试本次阅读
+                        logger.info("🔄 Cookie刷新成功，重试本次阅读")
+                        continue
+                    else:
+                        failed_count += 1
+                        logger.error("❌ Cookie刷新失败")
+                        if failed_count >= 3:
+                            error_msg = "连续3次Cookie刷新失败，停止运行"
+                            send_notification("微信读书刷时长失败", error_msg)
+                            return False
                 else:
                     failed_count += 1
-                    logger.error("❌ Cookie刷新失败")
+                    logger.warning("非鉴权错误，等待后重试当前阅读")
                     if failed_count >= 3:
-                        error_msg = "连续3次Cookie刷新失败，停止运行"
-                        send_notification("微信读书刷时长失败", error_msg)
+                        error_msg = f"连续3次阅读失败: errCode={err_code}, errMsg={err_msg}"
+                        send_notification("微信读书刷时长异常", error_msg)
                         return False
+                    time.sleep(5)
+                    continue
                         
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ 网络请求异常: {e}")
