@@ -42,7 +42,7 @@ WXREAD_CURL_BASH = os.getenv('WXREAD_CURL_BASH', '')
 # ========== 默认headers和cookies（当WXREAD_CURL_BASH为空时使用）==========
 cookies = {
     'wr_skey': '',
-    'pac_uid': '0_e63870bcecc18',
+    'pac_uid': '',
 }
 
 headers = {
@@ -105,6 +105,12 @@ def parse_curl_command(curl_command):
     headers_temp = {}
     cookies_temp = {}
     
+    raw_input = curl_command.strip()
+    if (raw_input.startswith("'") and raw_input.endswith("'")) or (
+        raw_input.startswith('"') and raw_input.endswith('"')
+    ):
+        raw_input = raw_input[1:-1]
+
     # 提取headers（兼容单引号/双引号）
     header_matches = re.findall(r"-H\s+(['\"])([^:]+):\s*(.*?)\1", curl_command)
     for _, key, value in header_matches:
@@ -123,6 +129,9 @@ def parse_curl_command(curl_command):
         cookie_string = cookie_b_match.group(2)
     elif cookie_header:
         cookie_string = cookie_header
+    elif '=' in raw_input:
+        # 兼容直接传入纯cookie字符串的场景
+        cookie_string = raw_input
     
     # 解析cookie字符串
     if cookie_string:
