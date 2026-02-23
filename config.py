@@ -1,200 +1,374 @@
 #!/usr/bin/env python3
 # _*_ coding:utf-8 _*_
 """
-微信读书自动刷时长脚本配置
-适配青龙面板环境变量系统
+微信读书自动刷时长脚本主程序
+适配青龙面板通知系统
 """
-import os
-import re
+import json
+import time
+import random
+import hashlib
+import urllib.parse
+import logging
 import sys
+import requests
+from http.cookies import SimpleCookie
 
-# 添加青龙面板路径，确保能导入notify模块
+# 添加青龙面板路径
 sys.path.append('/ql/scripts')
 try:
-    from notify import send
-    HAS_NOTIFY = True
+    from notify import send as ql_send
+    HAS_QL_NOTIFY = True
 except ImportError:
-    HAS_NOTIFY = False
-    print("警告：未找到青龙notify模块，将使用原推送方式")
+    HAS_QL_NOTIFY = False
 
-# ========== 基础配置 ==========
-# 阅读次数（每次30秒，默认20次=10分钟）
-READ_NUM = 20 #int(os.getenv('READ_NUM', '120'))
+# 导入配置文件
+from config import (
+    data, headers, cookies, READ_NUM, PUSH_METHOD,
+    book, chapter, validate_config
+)
 
-# 推送方法（留空则不推送，可选：pushplus, wxpusher, telegram等青龙支持的所有方式）
-PUSH_METHOD = "wxpusher" #os.getenv('PUSH_METHOD', '')
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('wxread')
 
-# ========== 微信读书Cookie配置 ==========
-WXREAD_CURL_BASH = os.getenv('WXREAD_CURL_BASH', '')
+# 加密盐和URL
+KEY = "3c5c8717f3daf09iop3423zafeqoi"
+COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread"}
+READ_URL = "https://weread.qq.com/web/book/read"
+RENEW_URL = "https://weread.qq.com/web/login/renewal"
+FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
 
-# ========== 青龙面板推送配置（通过环境变量设置）==========
-# 以下为青龙面板支持的各种推送方式的环境变量名
-# 用户只需在青龙面板的环境变量中配置对应值即可
-# 
-# 常用推送配置示例：
-# PUSH_PLUS_TOKEN: pushplus的token
-# TG_BOT_TOKEN: Telegram bot token
-# TG_USER_ID: Telegram用户ID
-# WXPUSHER_APP_TOKEN: wxpusher的appToken
-# WXPUSHER_UIDS: wxpusher的用户ID（多个用;分隔）
-# 更多配置请参考青龙面板的sendNotify.js/notify.py
+def encode_data(data_dict):
+    """对数据进行URL编码排序"""
+    sorted_items = sorted(data_dict.items(), key=lambda x: x[0])
+    encoded_items = []
+    for key, value in sorted_items:
+        encoded_value = urllib.parse.quote(str(value), safe='')
+        encoded_items.append(f"{key}={encoded_value}")
+    return '&'.join(encoded_items)
 
-# ========== 默认headers和cookies（当WXREAD_CURL_BASH为空时使用）==========
-cookies = {
-    'wr_skey': '',
-    'pac_uid': '',
-}
+def calculate_hash(input_string):
+    """计算请求签名哈希值"""
+    hash_value1 = 0x15051505
+    hash_value2 = hash_value1
+    length = len(input_string)
+    index = length - 1
+    
+    while index > 0:
+        hash_value1 = 0x7fffffff & (hash_value1 ^ ord(input_string[index]) << (length - index) % 30)
+        hash_value2 = 0x7fffffff & (hash_value2 ^ ord(input_string[index - 1]) << index % 30)
+        index -= 2
+    
+    return hex(hash_value1 + hash_value2)[2:].lower()
 
-headers = {
-    'accept': 'application/json, text/plain, */*',
-    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ko;q=0.5',
-    'content-type': 'application/json',
-    'origin': 'https://weread.qq.com',
-    'referer': 'https://weread.qq.com/',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
-}
+def refresh_cookie():
+    """刷新微信读书Cookie"""
+    logger.info("正在刷新Cookie...")
+    try:
+        old_skey = cookies.get('wr_skey', '')
+        response = requests.post(
+            RENEW_URL,
+            headers=headers,
+            cookies=cookies,
+            json=COOKIE_DATA,
+            timeout=10
+        )
 
-# 书籍ID列表（可随机选择）
-book = [
-    "36d322f07186022636daa5e", "6f932ec05dd9eb6f96f14b9", "43f3229071984b9343f04a4",
-    "d7732ea0813ab7d58g0184b8", "3d03298058a9443d052d409", "4fc328a0729350754fc56d4",
-    "a743220058a92aa746632c0", "140329d0716ce81f140468e", "1d9321c0718ff5e11d9afe8",
-    "ff132750727dc0f6ff1f7b5", "e8532a40719c4eb7e851cbe", "9b13257072562b5c9b1c8d6"
-]
+        if response.status_code != 200:
+            logger.error(f"❌ Cookie刷新失败: HTTP {response.status_code}")
+            return False
 
-# 章节ID列表（可随机选择）
-chapter = [
-    "ecc32f3013eccbc87e4b62e", "a87322c014a87ff679a21ea", "e4d32d5015e4da3b7fbb1fa",
-    "16732dc0161679091c5aeb1", "8f132430178f14e45fce0f7", "c9f326d018c9f0f895fb5e4",
-    "45c322601945c48cce2e120", "d3d322001ad3d9446802347", "65132ca01b6512bd43d90e3",
-    "c20321001cc20ad4d76f5ae", "c51323901dc51ce410c121b", "aab325601eaab3238922e53",
-    "9bf32f301f9bf31c7ff0a60", "c7432af0210c74d97b01b1c", "70e32fb021170efdf2eca12",
-    "6f4322302126f4922f45dec"
-]
+        try:
+            body_data = response.json()
+        except ValueError:
+            body_data = {}
 
-# 默认阅读数据（阅读《三体》）
-data = {
-    "appId": "wb182564874603h266381671",
-    "b": "ce032b305a9bc1ce0b0dd2a",  # 书籍ID
-    "c": "7f632b502707f6ffaa6bf2e",  # 章节ID
-    "ci": 27,                         # 章节索引
-    "co": 389,                        # 字符偏移
-    "sm": "19聚会《三体》网友的聚会地点是一处僻静",  # 片段
-    "pr": 74,                         # 进度百分比
-    "rt": 15,                         # 阅读时间（秒）
-    "ts": 0,                          # 时间戳（会动态生成）
-    "rn": 0,                          # 随机数（会动态生成）
-    "sg": "",                         # 签名（会动态生成）
-    "ct": 0,                          # 当前时间戳（会动态生成）
-    "ps": "4ee326507a65a465g015fae",  # 上一节ID
-    "pc": "aab32e207a65a466g010615",  # 上一章ID
-    "s": ""                           # 哈希值（会动态生成）
-}
+        if isinstance(body_data, dict) and body_data.get("errCode") not in (None, 0):
+            logger.error(
+                f"❌ Cookie刷新失败: errCode={body_data.get('errCode')}, "
+                f"errMsg={body_data.get('errMsg')}"
+            )
+            if body_data.get("errCode") == -2013:
+                logger.error("❌ 鉴权失败，请重新抓包更新WXREAD_CURL_BASH环境变量")
+            return False
 
-# ========== 辅助函数 ==========
-def parse_curl_command(curl_command):
-    """
-    从curl命令中提取headers和cookies
-    支持格式：
-    1. -H 'Cookie: xxx'
-    2. -b 'xxx'
-    """
-    if not curl_command:
-        return headers, cookies
-    
-    headers_temp = {}
-    cookies_temp = {}
-    
-    raw_input = curl_command.strip()
-    if (raw_input.startswith("'") and raw_input.endswith("'")) or (
-        raw_input.startswith('"') and raw_input.endswith('"')
-    ):
-        raw_input = raw_input[1:-1]
+        # 使用响应的cookiejar，避免Set-Cookie里expires逗号导致的解析错误
+        new_cookies = requests.utils.dict_from_cookiejar(response.cookies)
+        if not new_cookies:
+            # 兼容部分场景requests未解析Set-Cookie
+            set_cookie_values = []
+            raw_headers = getattr(response.raw, "headers", None)
+            if raw_headers and hasattr(raw_headers, "get_all"):
+                set_cookie_values = raw_headers.get_all("Set-Cookie") or []
+            if not set_cookie_values:
+                set_cookie_header = response.headers.get("Set-Cookie", "")
+                if set_cookie_header:
+                    set_cookie_values = [set_cookie_header]
 
-    # 提取headers（兼容单引号/双引号）
-    header_matches = re.findall(r"-H\s+(['\"])([^:]+):\s*(.*?)\1", curl_command)
-    for _, key, value in header_matches:
-        headers_temp[key.strip()] = value.strip()
-    
-    # 提取cookies（两种方式）
-    cookie_string = ""
-    
-    # 方式1：从 -H 'Cookie:' 提取
-    cookie_header = next((v for k, v in headers_temp.items() 
-                         if k.lower() == 'cookie'), '')
-    
-    # 方式2：从 -b 参数提取
-    cookie_b_match = re.search(r"-b\s+(['\"])(.*?)\1", curl_command)
-    if cookie_b_match:
-        cookie_string = cookie_b_match.group(2)
-    elif cookie_header:
-        cookie_string = cookie_header
-    elif '=' in raw_input:
-        # 兼容直接传入纯cookie字符串的场景
-        cookie_string = raw_input
-    
-    # 解析cookie字符串
-    if cookie_string:
-        for cookie_item in cookie_string.split(';'):
-            if '=' in cookie_item:
-                key, value = cookie_item.strip().split('=', 1)
-                cookies_temp[key] = value
-    
-    # 移除headers中的Cookie项（避免重复）
-    final_headers = {k: v for k, v in headers_temp.items() 
-                    if k.lower() != 'cookie'}
-    
-    # 合并默认headers（优先使用抓包得到的headers）
-    merged_headers = headers.copy()
-    merged_headers.update(final_headers)
-    
-    # 更新默认cookies
-    final_cookies = cookies.copy()
-    final_cookies.update(cookies_temp)
-    
-    return merged_headers, final_cookies
+            if set_cookie_values:
+                parsed = SimpleCookie()
+                for val in set_cookie_values:
+                    try:
+                        parsed.load(val)
+                    except Exception:
+                        continue
+                new_cookies = {k: v.value for k, v in parsed.items()}
 
-# 解析curl命令获取headers和cookies
-if WXREAD_CURL_BASH:
-    headers, cookies = parse_curl_command(WXREAD_CURL_BASH)
-    print(f"✅ 已从环境变量解析Cookie，共{len(cookies)}个cookie")
-else:
-    print("⚠️  未设置WXREAD_CURL_BASH环境变量，使用默认headers/cookies")
+        # 过滤服务端返回的空值，避免把本地有效cookie覆盖成空字符串
+        new_cookies = {k: v for k, v in new_cookies.items() if v}
 
-# ========== 配置验证 ==========
-def validate_config():
-    """验证配置是否完整"""
-    errors = []
-    
-    if not WXREAD_CURL_BASH:
-        errors.append("请设置WXREAD_CURL_BASH环境变量（抓包获取的curl命令）")
-    
-    if not cookies.get('wr_skey'):
-        errors.append("Cookie中缺少wr_skey字段，请检查WXREAD_CURL_BASH格式")
-    
-    if not cookies.get('pac_uid'):
-        errors.append("Cookie中缺少pac_uid字段")
-    
-    if errors:
-        error_msg = "配置错误：\n" + "\n".join(f"  • {error}" for error in errors)
-        print(error_msg)
+        if not new_cookies:
+            logger.error("❌ 未获取到刷新后的Cookie")
+            logger.error(f"调试信息: status={response.status_code}, set-cookie={response.headers.get('Set-Cookie')}")
+            logger.error(f"调试信息: body={response.text[:200]}")
+            return False
+
+        new_skey = new_cookies.get('wr_skey') or old_skey
+        if not new_skey:
+            logger.error("❌ 未找到新的wr_skey")
+            logger.error(f"调试信息: cookies={list(new_cookies.keys())}, wr_skey={repr(new_skey)}")
+            logger.error(f"调试信息: body={response.text[:200]}")
+            return False
+
+        cookies.update(new_cookies)
+        cookies['wr_skey'] = new_skey
+        logger.info(f"✅ Cookie刷新成功，当前密钥：{new_skey}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Cookie刷新失败: {e}")
         return False
+
+def fix_synckey():
+    """修复缺少synckey的情况"""
+    try:
+        response = requests.post(
+            FIX_SYNCKEY_URL,
+            headers=headers,
+            cookies=cookies,
+            data=json.dumps({"bookIds": ["3300060341"]}, separators=(',', ':')),
+            timeout=10
+        )
+        if response.status_code == 200:
+            logger.info("✅ synckey修复请求发送成功")
+            return True
+        else:
+            logger.warning(f"⚠️  synckey修复失败: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ synckey修复异常: {e}")
+        return False
+
+def send_notification(title, content):
+    """发送通知（使用青龙面板的notify模块）"""
+    if not PUSH_METHOD:
+        logger.info("未配置推送方式，跳过通知")
+        return False
+    
+    try:
+        if HAS_QL_NOTIFY:
+            # 使用青龙面板的send函数
+            logger.info(f"使用青龙面板通知系统发送: {title}")
+            ql_send(title, content)
+            return True
+        else:
+            logger.warning("未找到青龙notify模块，无法发送通知")
+            return False
+    except Exception as e:
+        logger.error(f"❌ 通知发送失败: {e}")
+        return False
+
+def simulate_reading():
+    """模拟阅读主函数"""
+    logger.info("=" * 50)
+    logger.info("微信读书自动刷时长脚本启动")
+    logger.info(f"目标阅读次数: {READ_NUM}次（约{READ_NUM * 0.5}分钟）")
+    logger.info("=" * 50)
+    
+    # 验证配置
+    if not validate_config():
+        error_msg = "配置验证失败，请检查WXREAD_CURL_BASH环境变量"
+        send_notification("微信读书刷时长失败", error_msg)
+        return False
+    
+    # 初始Cookie刷新（失败时继续尝试使用现有Cookie）
+    if not refresh_cookie():
+        logger.warning("⚠️  初始Cookie刷新失败，将尝试使用现有Cookie继续")
+    
+    index = 1
+    last_time = int(time.time()) - 30
+    success_count = 0
+    failed_count = 0
+    
+    while index <= READ_NUM:
+        try:
+            # 准备请求数据
+            current_data = data.copy()
+            current_data.pop('s', None)  # 移除旧的签名
+            
+            # 随机选择书籍和章节
+            current_data['b'] = random.choice(book)
+            current_data['c'] = random.choice(chapter)
+            
+            # 设置时间参数
+            current_time = int(time.time())
+            current_data['ct'] = current_time
+            current_data['rt'] = current_time - last_time
+            current_data['ts'] = current_time * 1000 + random.randint(0, 1000)
+            current_data['rn'] = random.randint(0, 1000)
+            
+            # 计算签名
+            signature_base = f"{current_data['ts']}{current_data['rn']}{KEY}"
+            current_data['sg'] = hashlib.sha256(signature_base.encode()).hexdigest()
+            current_data['s'] = calculate_hash(encode_data(current_data))
+            
+            logger.info(f"📖 第 {index}/{READ_NUM} 次阅读尝试")
+            logger.debug(f"请求数据: {json.dumps(current_data, ensure_ascii=False)}")
+            
+            # 发送阅读请求
+            response = requests.post(
+                READ_URL,
+                headers=headers,
+                cookies=cookies,
+                data=json.dumps(current_data, separators=(',', ':')),
+                timeout=15
+            )
+            
+            try:
+                response_data = response.json()
+            except ValueError:
+                logger.error(f"❌ 响应不是JSON: HTTP {response.status_code}, body={response.text[:200]}")
+                failed_count += 1
+                if failed_count >= 3:
+                    error_msg = "连续3次收到非JSON响应，停止运行"
+                    send_notification("微信读书刷时长异常", error_msg)
+                    return False
+                time.sleep(5)
+                continue
+            logger.debug(f"响应数据: {json.dumps(response_data, ensure_ascii=False)}")
+            
+            if 'succ' in response_data:
+                if 'synckey' in response_data:
+                    # 阅读成功
+                    last_time = current_time
+                    success_count += 1
+                    progress = (index / READ_NUM) * 100
+                    logger.info(f"✅ 阅读成功 ({success_count}次) - 进度: {progress:.1f}%")
+                    
+                    index += 1
+                    if index <= READ_NUM:
+                        # 等待30秒进行下一次阅读
+                        time.sleep(30)
+                else:
+                    # 缺少synckey，尝试修复
+                    logger.warning("⚠️  响应中缺少synckey，尝试修复...")
+                    if fix_synckey():
+                        # 修复后重试本次阅读
+                        continue
+                    else:
+                        failed_count += 1
+                        logger.error("❌ synckey修复失败")
+                        if failed_count >= 3:
+                            error_msg = "连续3次synckey修复失败，停止运行"
+                            send_notification("微信读书刷时长异常", error_msg)
+                            return False
+            else:
+                err_code = response_data.get('errCode')
+                err_msg = str(response_data.get('errMsg', ''))
+                logger.warning(f"❌ 阅读失败: errCode={err_code}, errMsg={err_msg}")
+
+                is_auth_error = err_code in (-2013, -2014) or ('鉴权' in err_msg)
+                if is_auth_error:
+                    logger.warning("检测到鉴权相关错误，尝试刷新Cookie...")
+                    if refresh_cookie():
+                        # Cookie刷新成功，重试本次阅读
+                        logger.info("🔄 Cookie刷新成功，重试本次阅读")
+                        continue
+                    else:
+                        failed_count += 1
+                        logger.error("❌ Cookie刷新失败")
+                        if failed_count >= 3:
+                            error_msg = "连续3次Cookie刷新失败，停止运行"
+                            send_notification("微信读书刷时长失败", error_msg)
+                            return False
+                else:
+                    failed_count += 1
+                    logger.warning("非鉴权错误，等待后重试当前阅读")
+                    if failed_count >= 3:
+                        error_msg = f"连续3次阅读失败: errCode={err_code}, errMsg={err_msg}"
+                        send_notification("微信读书刷时长异常", error_msg)
+                        return False
+                    time.sleep(5)
+                    continue
+                        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ 网络请求异常: {e}")
+            failed_count += 1
+            if failed_count >= 3:
+                error_msg = f"连续3次网络异常: {e}"
+                send_notification("微信读书刷时长网络异常", error_msg)
+                return False
+            time.sleep(5)  # 网络异常稍作等待
+            continue
+            
+        except Exception as e:
+            logger.error(f"❌ 未知错误: {e}")
+            failed_count += 1
+            if failed_count >= 3:
+                error_msg = f"连续3次未知错误: {e}"
+                send_notification("微信读书刷时长异常", error_msg)
+                return False
+            time.sleep(5)
+            continue
+    
+    # 阅读完成
+    total_minutes = success_count * 0.5
+    success_msg = (
+        f"🎉 微信读书自动刷时长完成！\n\n"
+        f"📊 统计信息：\n"
+        f"• 成功阅读次数: {success_count}/{READ_NUM}\n"
+        f"• 失败次数: {failed_count}\n"
+        f"• 累计时长: {total_minutes:.1f}分钟\n"
+        f"• 完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"✅ 任务执行成功！"
+    )
+    
+    logger.info("=" * 50)
+    logger.info(f"脚本执行完成")
+    logger.info(f"成功: {success_count}次, 失败: {failed_count}次")
+    logger.info(f"累计阅读时长: {total_minutes:.1f}分钟")
+    logger.info("=" * 50)
+    
+    # 发送完成通知
+    if PUSH_METHOD:
+        send_notification("微信读书刷时长完成", success_msg)
     
     return True
 
+def main():
+    """主函数"""
+    try:
+        success = simulate_reading()
+        if success:
+            logger.info("✅ 脚本执行成功")
+            return 0
+        else:
+            logger.error("❌ 脚本执行失败")
+            return 1
+    except KeyboardInterrupt:
+        logger.info("⏹️  用户中断执行")
+        send_notification("微信读书刷时长中断", "用户手动中断了脚本执行")
+        return 130
+    except Exception as e:
+        logger.error(f"❌ 脚本执行异常: {e}")
+        send_notification("微信读书刷时长异常", f"脚本执行异常: {str(e)}")
+        return 1
+
 if __name__ == "__main__":
-    # 测试配置解析
-    print("=" * 50)
-    print("微信读书刷时长脚本配置检查")
-    print("=" * 50)
-    print(f"阅读次数: {READ_NUM}次（约{READ_NUM*0.5}分钟）")
-    print(f"推送方式: {PUSH_METHOD if PUSH_METHOD else '无推送'}")
-    print(f"Cookie解析: {'成功' if WXREAD_CURL_BASH else '使用默认值'}")
-    print(f"Headers数量: {len(headers)}")
-    print(f"Cookies数量: {len(cookies)}")
-    print("=" * 50)
-    
-    if validate_config():
-        print("✅ 配置检查通过")
-    else:
-        print("❌ 配置检查失败，请修复以上问题")
+    exit_code = main()
+    sys.exit(exit_code)
